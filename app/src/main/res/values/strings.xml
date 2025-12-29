@@ -1,0 +1,10 @@
+<resources>
+    <string name="app_name">Application-hitchock</string>
+    <string name="welcome_title">Welcome!</string>
+    <string name="welcome_subtitle">Ready to explore?</string>
+    <string name="card_description">This is a demo page running on your Android device. You can customize this layout to build amazing apps.</string>
+    <string name="btn_get_started">Get Started</string>
+    <string name="toast_message">Welcome to your new app!</string>
+    <string name="start_recording">Start Recording</string>
+    <string name="stop_recording">Stop Recording</string>
+</resources>
