@@ -31,6 +31,7 @@
         android:layout_height="match_parent" />
 
     <androidx.cardview.widget.CardView
+        android:id="@+id/previewCardView"
         android:layout_width="160dp"
         android:layout_height="213dp"
         app:cardCornerRadius="12dp"
@@ -86,6 +87,36 @@
         android:backgroundTint="#FF5555"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintTop_toBottomOf="@+id/connectButton" />
+
+    <LinearLayout
+        android:id="@+id/intervalControlLayout"
+        android:layout_width="200dp"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:background="#80000000"
+        android:padding="8dp"
+        android:layout_marginBottom="20dp"
+        android:layout_marginStart="20dp"
+        app:layout_constraintBottom_toTopOf="@+id/video_capture_button"
+        app:layout_constraintStart_toStartOf="parent">
+
+        <TextView
+            android:id="@+id/intervalLabel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Track Interval: 4"
+            android:textColor="#FFFFFF"
+            android:textSize="14sp" />
+
+        <SeekBar
+            android:id="@+id/intervalSeekBar"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:max="19"
+            android:progress="3" />
+            <!-- Range: 1 to 20. Progress 0 = 1, Progress 19 = 20 -->
+
+    </LinearLayout>
 
     <Button
         android:id="@+id/video_capture_button"

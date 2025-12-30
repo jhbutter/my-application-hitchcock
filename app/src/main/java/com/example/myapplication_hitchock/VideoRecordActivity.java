@@ -18,6 +18,7 @@ import android.provider.MediaStore;
 import android.util.Log;
 import android.util.Range;
 import android.util.Size;
+import android.view.MotionEvent;
 import android.view.View;
 import android.widget.Button;
 
@@ -25,6 +26,8 @@ import java.io.FileInputStream;
 import java.io.OutputStream;
 import android.widget.EditText;
 import android.widget.ImageView;
+import android.widget.SeekBar;
+import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.activity.result.ActivityResultLauncher;
@@ -37,6 +40,7 @@ import androidx.camera.core.ImageProxy;
 import androidx.camera.core.Preview;
 import androidx.camera.lifecycle.ProcessCameraProvider;
 import androidx.camera.view.PreviewView;
+import androidx.cardview.widget.CardView;
 import androidx.core.content.ContextCompat;
 import androidx.core.view.WindowCompat;
 import androidx.core.view.WindowInsetsCompat;
@@ -147,6 +151,75 @@ public class VideoRecordActivity extends AppCompatActivity {
         
         // Initialize Processor
         processor = new DollyZoomProcessor();
+
+        // Track Interval Control
+        TextView intervalLabel = findViewById(R.id.intervalLabel);
+        SeekBar intervalSeekBar = findViewById(R.id.intervalSeekBar);
+
+        if (intervalLabel != null && intervalSeekBar != null) {
+            // Initial state (match default in Processor or desired default)
+            int defaultInterval = 4;
+            intervalSeekBar.setProgress(defaultInterval - 1); // 0-based
+            intervalLabel.setText("Track Interval: " + defaultInterval);
+            processor.setTrackingInterval(defaultInterval);
+
+            intervalSeekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                @Override
+                public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                    int interval = progress + 1; // 1 to 20
+                    intervalLabel.setText("Track Interval: " + interval);
+                    if (processor != null) {
+                        processor.setTrackingInterval(interval);
+                    }
+                }
+
+                @Override
+                public void onStartTrackingTouch(SeekBar seekBar) {}
+
+                @Override
+                public void onStopTrackingTouch(SeekBar seekBar) {}
+            });
+        }
+
+        // Draggable Preview Card
+        CardView previewCardView = findViewById(R.id.previewCardView);
+        if (previewCardView != null) {
+            previewCardView.setOnTouchListener(new View.OnTouchListener() {
+                float dX, dY;
+                float startX, startY;
+                boolean isClick = false;
+
+                @Override
+                public boolean onTouch(View view, MotionEvent event) {
+                    switch (event.getAction()) {
+                        case MotionEvent.ACTION_DOWN:
+                            dX = view.getX() - event.getRawX();
+                            dY = view.getY() - event.getRawY();
+                            startX = event.getRawX();
+                            startY = event.getRawY();
+                            isClick = true;
+                            return true; // Consume to receive subsequent events
+                        case MotionEvent.ACTION_MOVE:
+                            if (Math.abs(event.getRawX() - startX) > 10 || Math.abs(event.getRawY() - startY) > 10) {
+                                isClick = false;
+                            }
+                            view.animate()
+                                    .x(event.getRawX() + dX)
+                                    .y(event.getRawY() + dY)
+                                    .setDuration(0)
+                                    .start();
+                            return true;
+                        case MotionEvent.ACTION_UP:
+                            if (isClick) {
+                                view.performClick();
+                            }
+                            return true;
+                        default:
+                            return false;
+                    }
+                }
+            });
+        }
 
         rectOverlayView.setOnRectSelectedListener(new RectOverlayView.OnRectSelectedListener() {
             @Override

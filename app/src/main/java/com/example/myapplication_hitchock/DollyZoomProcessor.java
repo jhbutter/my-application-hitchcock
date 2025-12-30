@@ -35,8 +35,8 @@ public class DollyZoomProcessor {
     private List<Double> scaleHistory = new ArrayList<>();
     private List<Double> cxHistory = new ArrayList<>();
     private List<Double> cyHistory = new ArrayList<>();
-    private static final int WINDOW_SIZE = 5; // Reduced from 15 to 5 for faster response
-    
+    private static final int WINDOW_SIZE = 8; // Increased to 8 for smoother output
+
     // Warmup frames to stabilize tracker
     private static final int WARMUP_FRAMES = 15;
 
@@ -54,7 +54,20 @@ public class DollyZoomProcessor {
     }
 
     // Downscale factor for tracker (1.0 = no downscale, 0.5 = 1/2 size)
-    private static final double TRACKER_SCALE = 0.5; // Try 0.5 to improve CSRT performance
+    // 0.5 (320x240) to reduce quantization error (jitter) compared to 0.25
+    private static final double TRACKER_SCALE = 0.5;
+    
+    // Tracking Interval (Frames to skip between tracker updates)
+    // 1 = track every frame (no skip)
+    // 4 = track 1 frame, predict 3 frames (Compensate for higher resolution)
+    private int trackingInterval = 4;
+
+    public void setTrackingInterval(int interval) {
+        if (interval < 1) interval = 1;
+        if (interval > 30) interval = 30; // Limit to reasonable max
+        this.trackingInterval = interval;
+        Log.d(TAG, "Tracking Interval set to: " + interval);
+    }
 
     public void init(Mat frame, android.graphics.RectF initialRect) {
         width = frame.cols();
@@ -109,7 +122,6 @@ public class DollyZoomProcessor {
         Log.d(TAG, "Init Diagonal: " + initDiagonal);
     }
     
-    // ... initKalman ...
     private void initKalman(Rect2d rect) {
         kalman = new KalmanFilter(6, 3, 0, CvType.CV_32F);
 
@@ -133,15 +145,23 @@ public class DollyZoomProcessor {
         measurementMatrix.put(2, 2, 1);
         kalman.set_measurementMatrix(measurementMatrix);
 
-        // Process Noise Covariance (Q) - Trust process/prediction more if low
-        // Increased to 1e-1 to allow faster reaction to rapid zoom changes
+        // Process Noise Covariance (Q)
         Mat processNoiseCov = Mat.eye(6, 6, CvType.CV_32F);
-        Core.multiply(processNoiseCov, new Scalar(1e-1), processNoiseCov);
+        // Scale (Index 0): Allow some flexibility for zoom
+        processNoiseCov.put(0, 0, 1e-3);
+        // Position (Index 1, 2): Very stiff, assume center doesn't move much (Fixes jitter)
+        processNoiseCov.put(1, 1, 1e-5);
+        processNoiseCov.put(2, 2, 1e-5);
+        // Velocities (Index 3-5):
+        processNoiseCov.put(3, 3, 1e-2);
+        processNoiseCov.put(4, 4, 1e-2);
+        processNoiseCov.put(5, 5, 1e-2);
         kalman.set_processNoiseCov(processNoiseCov);
 
-        // Measurement Noise Covariance (R) - Trust measurement more if low
+        // Measurement Noise Covariance (R)
         Mat measurementNoiseCov = Mat.eye(3, 3, CvType.CV_32F);
-        Core.multiply(measurementNoiseCov, new Scalar(1e-3), measurementNoiseCov);
+        // Trust measurement less to filter out tracker noise
+        Core.multiply(measurementNoiseCov, new Scalar(0.1), measurementNoiseCov);
         kalman.set_measurementNoiseCov(measurementNoiseCov);
 
         // Initial State
@@ -162,44 +182,40 @@ public class DollyZoomProcessor {
             return frame;
         }
 
-        // 1. Update Tracker on Downscaled Frame
-        Mat smallFrame = new Mat();
-        Imgproc.resize(frame, smallFrame, new Size(), TRACKER_SCALE, TRACKER_SCALE, Imgproc.INTER_LINEAR);
-        
-        Rect smallTrackRect = new Rect();
-        boolean success = tracker.update(smallFrame, smallTrackRect);
-        smallFrame.release();
-        
-        // Scale rect back up
-        Rect trackRect = new Rect(
-            (int)(smallTrackRect.x / TRACKER_SCALE),
-            (int)(smallTrackRect.y / TRACKER_SCALE),
-            (int)(smallTrackRect.width / TRACKER_SCALE),
-            (int)(smallTrackRect.height / TRACKER_SCALE)
-        );
-
-        // 2. Kalman Predict
+        // 1. Kalman Predict (Always Step 1)
+        // This updates the state transition matrix and error covariance
         Mat prediction = kalman.predict();
         double predScale = prediction.get(0, 0)[0];
         double predCx = prediction.get(1, 0)[0];
         double predCy = prediction.get(2, 0)[0];
 
-        double kScale, kCx, kCy;
+        // Default to prediction
+        double kScale = predScale;
+        double kCx = predCx;
+        double kCy = predCy;
+        
+        boolean doTracking = (frameCount % trackingInterval == 0);
+        boolean trackerUpdated = false;
 
-        // WARMUP LOGIC: Skip Kalman Update entirely
-        if (frameCount < WARMUP_FRAMES) {
-             kScale = 1.0;
-             kCx = initCx;
-             kCy = initCy;
-             
-             // Reset Kalman State to prevent drift
-             Mat statePost = kalman.get_statePost();
-             statePost.put(0, 0, 1.0);
-             statePost.put(1, 0, initCx);
-             statePost.put(2, 0, initCy);
-             kalman.set_statePost(statePost);
-        } else {
+        if (doTracking) {
+            // 2. Update Tracker on Downscaled Frame
+            Mat smallFrame = new Mat();
+            Imgproc.resize(frame, smallFrame, new Size(), TRACKER_SCALE, TRACKER_SCALE, Imgproc.INTER_LINEAR);
+            
+            Rect smallTrackRect = new Rect();
+            boolean success = tracker.update(smallFrame, smallTrackRect);
+            smallFrame.release();
+            
             if (success) {
+                trackerUpdated = true;
+                // Scale rect back up
+                Rect trackRect = new Rect(
+                    (int)(smallTrackRect.x / TRACKER_SCALE),
+                    (int)(smallTrackRect.y / TRACKER_SCALE),
+                    (int)(smallTrackRect.width / TRACKER_SCALE),
+                    (int)(smallTrackRect.height / TRACKER_SCALE)
+                );
+
                 double currCx = trackRect.x + trackRect.width / 2.0;
                 double currCy = trackRect.y + trackRect.height / 2.0;
                 double currentDiagonal = Math.sqrt(trackRect.width * trackRect.width + trackRect.height * trackRect.height);
@@ -208,11 +224,11 @@ public class DollyZoomProcessor {
                 if (currentDiagonal > 10.0) { // Avoid div by small number
                     rawScale = initDiagonal / currentDiagonal;
                     // Clamp raw scale strictly
-                    if (rawScale > 10.0) rawScale = 10.0; // Relaxed Clamp for stronger effect
+                    if (rawScale > 10.0) rawScale = 10.0;
                     if (rawScale < 0.5) rawScale = 0.5;
                 }
     
-                // Kalman Correct
+                // 3. Kalman Correct (Only when we have measurement)
                 Mat measurement = new Mat(3, 1, CvType.CV_32F);
                 measurement.put(0, 0, rawScale);
                 measurement.put(1, 0, currCx);
@@ -222,11 +238,6 @@ public class DollyZoomProcessor {
                 kScale = estimated.get(0, 0)[0];
                 kCx = estimated.get(1, 0)[0];
                 kCy = estimated.get(2, 0)[0];
-            } else {
-                // Lost tracking, rely on prediction
-                kScale = predScale;
-                kCx = predCx;
-                kCy = predCy;
             }
         }
         
@@ -257,35 +268,6 @@ public class DollyZoomProcessor {
         }
         
         // 4. Optimized Zoom (Crop & Resize) instead of WarpAffine
-        // We want the object (at smoothCx, smoothCy) to be moved to (initCx, initCy)
-        // And scaled by smoothScale.
-        // NewX = Scale * (OldX - smoothCx) + initCx? No.
-        // Affine Transform:
-        // [ scale, 0,     Tx ]
-        // [ 0,     scale, Ty ]
-        // where Tx = initCx - scale * smoothCx
-        //       Ty = initCy - scale * smoothCy
-        
-        // This is equivalent to:
-        // Crop a ROI centered at (smoothCx, smoothCy) with size (Width/scale, Height/scale)
-        // Then resize to (Width, Height).
-        // Wait, if we want to shift the center to initCx, we need to shift the crop center?
-        
-        // Let's verify:
-        // Center of cropped region in original image: (Cx_crop, Cy_crop)
-        // After resize (scale S), this center moves to (Width/2, Height/2) relative to the new image?
-        // No, resize maps the whole ROI to the whole Image.
-        // So the point (Cx_crop, Cy_crop) becomes the center of the output image.
-        // We want the object (smoothCx, smoothCy) to end up at (initCx, initCy).
-        
-        // If initCx is the screen center (W/2, H/2), then yes, we just crop around smoothCx.
-        // If initCx is NOT center, "Crop & Resize" forces it to center.
-        // HITCHCOCK ZOOM usually keeps the subject centered.
-        // So forcing it to center (W/2, H/2) is actually better/stabilized!
-        
-        // So: Crop ROI centered at (smoothCx, smoothCy) with size (W/scale, H/scale).
-        // Resize to (W, H).
-        
         Mat result = new Mat();
         
         if (smoothScale > 1.0) {
@@ -307,24 +289,16 @@ public class DollyZoomProcessor {
             // Fast Submat + Resize
             Mat cropMat = new Mat(frame, cropRect);
             Imgproc.resize(cropMat, result, new Size(width, height), 0, 0, Imgproc.INTER_LINEAR);
-            // cropMat is just a header, but we should release if created manually? Submat doesn't need release but good practice.
             
         } else {
-            // Zoom Out (Pad) - Rare for Hitchcock, but possible
-            // We can just return original frame or do Affine if strictly needed.
-            // For performance, let's just clamp scale to >= 1.0 or just do Affine for this rare case.
-            // Let's use Affine for scale < 1.0 as it's cleaner to handle black borders.
-            // But to keep it simple and fast, let's just clamp scale to 1.0 (no zoom out beyond original).
-            
             if (smoothScale < 1.0) smoothScale = 1.0;
-            
-            // If scale is essentially 1.0, just return copy
              frame.copyTo(result);
         }
 
         // Draw debug info
-        Imgproc.putText(result, String.format("Scale: %.2f", smoothScale), new org.opencv.core.Point(50, 50), 
-            Imgproc.FONT_HERSHEY_SIMPLEX, 1.0, new Scalar(0, 255, 0), 2);
+        String statusMode = trackerUpdated ? "TRACK" : "PREDICT";
+        Imgproc.putText(result, String.format("Scale: %.2f [%s]", smoothScale, statusMode), new org.opencv.core.Point(50, 50), 
+            Imgproc.FONT_HERSHEY_SIMPLEX, 1.0, trackerUpdated ? new Scalar(0, 255, 0) : new Scalar(0, 255, 255), 2);
         
         frameCount++;
         return result;
