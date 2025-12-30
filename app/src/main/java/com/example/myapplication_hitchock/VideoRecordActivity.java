@@ -151,6 +151,15 @@ public class VideoRecordActivity extends AppCompatActivity {
         
         // Initialize Processor
         processor = new DollyZoomProcessor();
+        
+        TextView debugInfoText = findViewById(R.id.debugInfoText);
+        processor.setOnDebugInfoListener(info -> {
+            runOnUiThread(() -> {
+                if (debugInfoText != null) {
+                    debugInfoText.setText(info);
+                }
+            });
+        });
 
         // Track Interval Control
         TextView intervalLabel = findViewById(R.id.intervalLabel);
@@ -310,10 +319,10 @@ public class VideoRecordActivity extends AppCompatActivity {
                 ImageAnalysis.Builder builder = new ImageAnalysis.Builder()
                         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                         .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
-                        .setTargetResolution(new Size(640, 480)); // Reduce resolution for performance
+                        .setTargetResolution(new Size(640, 480)); // VGA resolution for higher FPS
 
                 Camera2Interop.Extender<ImageAnalysis> extender = new Camera2Interop.Extender<>(builder);
-                extender.setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, new Range<>(30, 30));
+                extender.setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, new Range<>(60, 60));
 
                 ImageAnalysis imageAnalysis = builder.build();
                 imageAnalysis.setAnalyzer(cameraExecutor, this::analyzeImage);
@@ -391,15 +400,31 @@ public class VideoRecordActivity extends AppCompatActivity {
             Bitmap resultBitmap = Bitmap.createBitmap(processedMat.cols(), processedMat.rows(), Bitmap.Config.ARGB_8888);
             Utils.matToBitmap(processedMat, resultBitmap);
             
+            boolean isTracking = processor.isInitialized();
+
             runOnUiThread(() -> {
-                if (fullscreenProcessedView.getVisibility() != View.VISIBLE) {
-                    fullscreenProcessedView.setVisibility(View.VISIBLE);
-                    fullscreenProcessedView.setBackgroundColor(0xFF000000); // Black background to hide preview
-                }
-                fullscreenProcessedView.setImageBitmap(resultBitmap);
-                // Keep the small one updated too if visible, or just ignore it
-                if (processedImageView.getVisibility() == View.VISIBLE) {
+                if (isTracking) {
+                    // Tracking: Show processed image in the small preview card
+                    if (processedImageView.getVisibility() != View.VISIBLE) {
+                        processedImageView.setVisibility(View.VISIBLE);
+                    }
                     processedImageView.setImageBitmap(resultBitmap);
+
+                    // Ensure fullscreen processed view is GONE (so raw camera preview shows in background)
+                    if (fullscreenProcessedView.getVisibility() == View.VISIBLE) {
+                        fullscreenProcessedView.setVisibility(View.GONE);
+                        fullscreenProcessedView.setImageBitmap(null);
+                    }
+                } else {
+                    // Not tracking: Hide processed views
+                    if (processedImageView.getVisibility() == View.VISIBLE) {
+                        processedImageView.setVisibility(View.GONE);
+                        processedImageView.setImageBitmap(null);
+                    }
+                    if (fullscreenProcessedView.getVisibility() == View.VISIBLE) {
+                        fullscreenProcessedView.setVisibility(View.GONE);
+                        fullscreenProcessedView.setImageBitmap(null);
+                    }
                 }
             });
             
