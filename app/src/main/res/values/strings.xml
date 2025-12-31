@@ -1,10 +1,13 @@
 <resources>
-    <string name="app_name">Application-hitchock</string>
-    <string name="welcome_title">Welcome!</string>
-    <string name="welcome_subtitle">Ready to explore?</string>
-    <string name="card_description">This is a demo page running on your Android device. You can customize this layout to build amazing apps.</string>
-    <string name="btn_get_started">Get Started</string>
-    <string name="toast_message">Welcome to your new app!</string>
+    <string name="app_name">Hitchcock Zoom</string>
+    <string name="welcome_title">Hitchcock Effect</string>
+    <string name="welcome_subtitle">Create cinematic Dolly Zooms</string>
+    <string name="guide_title">How to use</string>
+    <string name="guide_step_1">1. Select Subject: Draw a box around your target.</string>
+    <string name="guide_step_2">2. Start: Press record to begin tracking.</string>
+    <string name="guide_step_3">3. Move: Walk towards/away from the subject.</string>
+    <string name="btn_get_started">Start Camera</string>
+    <string name="toast_message">Welcome!</string>
     <string name="start_recording">Start Recording</string>
     <string name="stop_recording">Stop Recording</string>
 </resources>

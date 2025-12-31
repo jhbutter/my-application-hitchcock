@@ -27,6 +27,10 @@ import java.util.List;
 public class DollyZoomProcessor {
     private static final String TAG = "DollyZoomProcessor";
 
+    private static final int WARMUP_FRAMES = 15;
+    private int width;
+    private int height;
+
     private KalmanFilter kalman;
     private boolean isInitialized = false;
     private double initDiagonal;
@@ -41,16 +45,42 @@ public class DollyZoomProcessor {
     private static final double QUALITY_LEVEL = 0.01;
     private static final double MIN_DISTANCE = 5;
 
-    // Smoothing history
-    private List<Double> scaleHistory = new ArrayList<>();
-    private List<Double> cxHistory = new ArrayList<>();
-    private List<Double> cyHistory = new ArrayList<>();
-    private static final int WINDOW_SIZE = 15; // Increased to 15 for smoother output at 60fps
+    // Smoothing
+    private double smoothedScale = 1.0;
+    private double smoothedCx = 0;
+    private double smoothedCy = 0;
+    
+    // Smoothing Factors (Adjustable)
+    // Default: 0.05 (Slow/Smooth)
+    private double smoothAlphaScale = 0.05; 
+    private double smoothAlphaPos = 0.03;   
 
-    // Warmup frames to stabilize tracker
-    private static final int WARMUP_FRAMES = 15;
-
-    private int width, height;
+    /**
+     * Set smoothing factor (0.01 to 1.0)
+     * Lower value = More Smooth (Slower response)
+     * Higher value = Less Smooth (Faster response)
+     * @param alpha Main smoothing alpha (applied to scale)
+     */
+    public void setSmoothingFactor(double alpha) {
+        // Clamp to reasonable range [0.005, 1.0]
+        if (alpha < 0.005) alpha = 0.005;
+        if (alpha > 1.0) alpha = 1.0;
+        
+        this.smoothAlphaScale = alpha;
+        // Position Smoothing Logic for "Lock" Stabilization:
+        // To achieve "Visual Stabilization" (keeping the subject fixed in center),
+        // the position tracking needs to be much more responsive (higher alpha) than the scale smoothing.
+        // If position alpha is too low, the subject will "drift" or "float" when the camera moves.
+        // We ensure a minimum responsiveness (0.5) to keep the lock tight.
+        this.smoothAlphaPos = Math.max(alpha * 5.0, 0.5);
+        
+        if (this.smoothAlphaPos > 1.0) this.smoothAlphaPos = 1.0;
+        
+        Log.d(TAG, String.format("Smoothing set to: Scale=%.4f, Pos=%.4f", smoothAlphaScale, smoothAlphaPos));
+    }
+    
+    // Average Radius Logic
+    private double initAvgRadius = 0;
 
     public DollyZoomProcessor() {
     }
@@ -62,9 +92,9 @@ public class DollyZoomProcessor {
     public void reset() {
         isInitialized = false;
         frameCount = 0;
-        scaleHistory.clear();
-        cxHistory.clear();
-        cyHistory.clear();
+        smoothedScale = 1.0;
+        smoothedCx = 0;
+        smoothedCy = 0;
         
         // Release Mats
         if (prevGray != null) prevGray.release();
@@ -80,7 +110,7 @@ public class DollyZoomProcessor {
     // Tracking Interval (Frames to skip between tracker updates)
     // 1 = track every frame (no skip)
     // 4 = track 1 frame, predict 3 frames (Compensate for higher resolution)
-    private int trackingInterval = 4;
+    private int trackingInterval = 1;
 
     public void setTrackingInterval(int interval) {
         if (interval < 1) interval = 1;
@@ -144,13 +174,27 @@ public class DollyZoomProcessor {
         Rect2d roiDouble = new Rect2d(initialRect.left, initialRect.top, initialRect.width(), initialRect.height());
         initKalman(roiDouble);
 
+        // Initialize Smoothing Variables
+        smoothedCx = initCx;
+        smoothedCy = initCy;
+        smoothedScale = 1.0;
+        
+        // Calculate Initial Radius (Centroid based)
+        Point[] points = corners.toArray(); // corners is released above but we can use prevPoints
+        Point[] pts = prevPoints.toArray();
+        double sumDist = 0;
+        for(Point p : pts) {
+            double dx = p.x - initCx;
+            double dy = p.y - initCy;
+            sumDist += Math.sqrt(dx*dx + dy*dy);
+        }
+        initAvgRadius = (pts.length > 0) ? sumDist / pts.length : 1.0;
+        if (initAvgRadius < 1.0) initAvgRadius = 1.0;
+
         isInitialized = true;
         frameCount = 0;
-        scaleHistory.clear();
-        cxHistory.clear();
-        cyHistory.clear();
         
-        Log.d(TAG, "Init Diagonal: " + initDiagonal);
+        Log.d(TAG, "Init Radius: " + initAvgRadius);
     }
     
     private void initKalman(Rect2d rect) {
@@ -176,29 +220,31 @@ public class DollyZoomProcessor {
         measurementMatrix.put(2, 2, 1);
         kalman.set_measurementMatrix(measurementMatrix);
 
-        // Process Noise Covariance (Q)
+        // Process Noise Covariance (Q) - RESPONSIVE STABILIZATION
         Mat processNoiseCov = Mat.eye(6, 6, CvType.CV_32F);
-        // Scale (Index 0): Allow some flexibility for zoom
+        // Scale: Low noise, smooth zoom
         processNoiseCov.put(0, 0, 1e-4);
-        // Position (Index 1, 2): Very stiff, assume center doesn't move much (Fixes jitter)
-        processNoiseCov.put(1, 1, 1e-5);
-        processNoiseCov.put(2, 2, 1e-5);
-        // Velocities (Index 3-5):
-        processNoiseCov.put(3, 3, 1e-3);
-        processNoiseCov.put(4, 4, 1e-3);
-        processNoiseCov.put(5, 5, 1e-3);
+        // Position: High noise allowed (We expect the subject to move in the frame)
+        // Was 1e-6 (Stationary assumption), now 1e-2 to allow tracking fast motion
+        processNoiseCov.put(1, 1, 1e-2);
+        processNoiseCov.put(2, 2, 1e-2);
+        // Velocities:
+        processNoiseCov.put(3, 3, 1e-2);
+        processNoiseCov.put(4, 4, 1e-2);
+        processNoiseCov.put(5, 5, 1e-2);
         kalman.set_processNoiseCov(processNoiseCov);
 
-        // Measurement Noise Covariance (R)
+        // Measurement Noise Covariance (R) - TRUST MEASUREMENT
         Mat measurementNoiseCov = Mat.eye(3, 3, CvType.CV_32F);
-        // Trust measurement less to filter out tracker noise
-        Core.multiply(measurementNoiseCov, new Scalar(100.0), measurementNoiseCov);
+        // Reduce noise covariance to trust the Optical Flow result more.
+        // Was 10.0 -> Now 1.0 (Standard trust)
+        Core.multiply(measurementNoiseCov, new Scalar(1.0), measurementNoiseCov);
         kalman.set_measurementNoiseCov(measurementNoiseCov);
 
         // Initial State
         initCx = rect.x + rect.width / 2.0;
         initCy = rect.y + rect.height / 2.0;
-        initDiagonal = Math.sqrt(rect.width * rect.width + rect.height * rect.height);
+        initDiagonal = Math.sqrt(rect.width * rect.width + rect.height * rect.height); // Still used for fallback if needed
 
         Mat statePre = new Mat(6, 1, CvType.CV_32F, new Scalar(0));
         statePre.put(0, 0, 1.0); // Initial scale
@@ -213,10 +259,31 @@ public class DollyZoomProcessor {
         void onDebugInfo(String info);
     }
     
+    public interface OnTrackedPointsListener {
+        void onTrackedPoints(List<Point> points, Rect trackRect, int frameWidth, int frameHeight);
+    }
+    
     private OnDebugInfoListener debugListener;
+    private OnTrackedPointsListener pointsListener;
     
     public void setOnDebugInfoListener(OnDebugInfoListener listener) {
         this.debugListener = listener;
+    }
+    
+    public void setOnTrackedPointsListener(OnTrackedPointsListener listener) {
+        this.pointsListener = listener;
+    }
+
+    // Helper for Median Calculation
+    private double calculateMedian(List<Double> list) {
+        if (list == null || list.isEmpty()) return 0;
+        java.util.Collections.sort(list);
+        int n = list.size();
+        if (n % 2 == 0) {
+            return (list.get(n/2 - 1) + list.get(n/2)) / 2.0;
+        } else {
+            return list.get(n/2);
+        }
     }
 
     public Mat process(Mat frame) {
@@ -246,123 +313,196 @@ public class DollyZoomProcessor {
         Mat currGray = new Mat();
         Imgproc.cvtColor(frame, currGray, Imgproc.COLOR_RGB2GRAY);
 
-        if (prevPoints.total() > 0) {
-            MatOfPoint2f nextPoints = new MatOfPoint2f();
-            MatOfByte status = new MatOfByte();
-            MatOfFloat err = new MatOfFloat();
+        // CHECK TRACKING INTERVAL
+        // Only run heavy Optical Flow if within interval
+        if (frameCount % trackingInterval == 0) {
 
-            // Calculate Optical Flow
-            Video.calcOpticalFlowPyrLK(prevGray, currGray, prevPoints, nextPoints, status, err);
+            if (prevPoints.total() > 0) {
+                MatOfPoint2f nextPoints = new MatOfPoint2f();
+                MatOfByte status = new MatOfByte();
+                MatOfFloat err = new MatOfFloat();
 
-            // Filter valid points
-            List<Point> prevList = prevPoints.toList();
-            List<Point> nextList = nextPoints.toList();
-            List<Byte> statusList = status.toList();
-            List<Point> goodNewPoints = new ArrayList<>();
+                // Calculate Optical Flow with larger window size for better tracking during fast motion
+                // winSize: 31x31 (default 21x21), maxLevel: 3
+                Video.calcOpticalFlowPyrLK(prevGray, currGray, prevPoints, nextPoints, status, err, new Size(31, 31), 3);
 
-            for (int i = 0; i < statusList.size(); i++) {
-                if (statusList.get(i) == 1) {
-                    goodNewPoints.add(nextList.get(i));
+                // Filter valid points
+                List<Point> prevList = prevPoints.toList();
+                List<Point> nextList = nextPoints.toList();
+                List<Byte> statusList = status.toList();
+                List<Point> goodNewPoints = new ArrayList<>();
+
+                for (int i = 0; i < statusList.size(); i++) {
+                    if (statusList.get(i) == 1) {
+                        goodNewPoints.add(nextList.get(i));
+                    }
                 }
-            }
-            
-            // Draw points for debug
-            for(Point p : goodNewPoints) {
-                Imgproc.circle(frame, p, 3, new Scalar(0, 255, 0), -1);
-            }
-
-            if (goodNewPoints.size() > 0) {
-                trackerUpdated = true;
                 
-                // Update prevPoints and prevGray
-                prevPoints.fromList(goodNewPoints);
-                prevGray.release();
-                prevGray = currGray.clone(); // Keep current as prev for next iter
-                
-                // Calculate Bounding Box
-                // We use bounding rect of points
-                MatOfPoint pointsMat = new MatOfPoint();
-                pointsMat.fromList(goodNewPoints);
-                trackRect = Imgproc.boundingRect(pointsMat);
-                pointsMat.release();
+                // Draw points removed - now sending to listener
+                /*
+                for(Point p : goodNewPoints) {
+                    Imgproc.circle(frame, p, 3, new Scalar(0, 255, 0), -1);
+                }
+                */
 
-                // 3. Kalman Update
-                double currCx = trackRect.x + trackRect.width / 2.0;
-                double currCy = trackRect.y + trackRect.height / 2.0;
-                double currentDiagonal = Math.sqrt(trackRect.width * trackRect.width + trackRect.height * trackRect.height);
-    
-                double rawScale = 1.0;
-                if (currentDiagonal > 10.0) { 
-                    rawScale = initDiagonal / currentDiagonal;
+                if (goodNewPoints.size() > 0) {
+                    trackerUpdated = true;
+                    
+                    // Update prevPoints and prevGray
+                    prevPoints.fromList(goodNewPoints);
+                    prevGray.release();
+                    prevGray = currGray.clone(); // Keep current as prev for next iter
+                    
+                    // Calculate Bounding Box
+                    // We use bounding rect of points
+                    MatOfPoint pointsMat = new MatOfPoint();
+                    pointsMat.fromList(goodNewPoints);
+                    trackRect = Imgproc.boundingRect(pointsMat);
+                    pointsMat.release();
+                    
+                    // Notify Listener
+                    /*
+                    if (pointsListener != null) {
+                        pointsListener.onTrackedPoints(goodNewPoints, trackRect, width, height);
+                    }
+                    */
+
+                    // 3. Kalman Update
+                    
+                    // Robust Measurement Calculation:
+                    // 1. Position: Use Median of tracked points (Robust to outliers)
+                    List<Double> xCoords = new ArrayList<>();
+                    List<Double> yCoords = new ArrayList<>();
+                    for (Point p : goodNewPoints) {
+                        xCoords.add(p.x);
+                        yCoords.add(p.y);
+                    }
+                    double currCx = calculateMedian(xCoords);
+                    double currCy = calculateMedian(yCoords);
+                    
+                    // 2. Scale: Use Weighted Average of Bounding Box and Average Radius
+                    // Bounding Box is stable but can be insensitive if only internal points move.
+                    // Average Radius is sensitive but noisy.
+                    // Mix: 70% Bounding Box (Stability) + 30% Average Radius (Responsiveness)
+                    
+                    // A. Bounding Box Scale
+                    double currentDiagonal = Math.sqrt(trackRect.width * trackRect.width + trackRect.height * trackRect.height);
+                    double scaleBox = 1.0;
+                    if (currentDiagonal > 10.0) {
+                        scaleBox = initDiagonal / currentDiagonal;
+                    }
+                    
+                    // B. Average Radius Scale
+                    double currentSumDist = 0;
+                    for (Point p : goodNewPoints) {
+                        double dx = p.x - currCx;
+                        double dy = p.y - currCy;
+                        currentSumDist += Math.sqrt(dx*dx + dy*dy);
+                    }
+                    double currentAvgRadius = (goodNewPoints.size() > 0) ? currentSumDist / goodNewPoints.size() : 1.0;
+                    if (currentAvgRadius < 1.0) currentAvgRadius = 1.0;
+                    
+                    double scaleRadius = 1.0;
+                    if (initAvgRadius > 1.0) {
+                        scaleRadius = initAvgRadius / currentAvgRadius;
+                    }
+                    
+                    // C. Mix
+                    double rawScale = 0.7 * scaleBox + 0.3 * scaleRadius;
+                    
+                    // Sanity Check
+                    if (rawScale > 10.0 || rawScale < 0.1) {
+                         // Limit
+                         if (rawScale > 10.0) rawScale = 10.0;
+                         if (rawScale < 0.1) rawScale = 0.1;
+                    }
+                    
+                    // Clamping
                     if (rawScale > 10.0) rawScale = 10.0;
                     if (rawScale < 0.5) rawScale = 0.5;
+
+                    // Correct Kalman
+                    Mat measurement = new Mat(3, 1, CvType.CV_32F);
+                    measurement.put(0, 0, rawScale);
+                    measurement.put(1, 0, currCx);
+                    measurement.put(2, 0, currCy);
+                    
+                    Mat estimated = kalman.correct(measurement);
+                    kScale = estimated.get(0, 0)[0];
+                    kCx = estimated.get(1, 0)[0];
+                    kCy = estimated.get(2, 0)[0];
+
+                } else {
+                    Log.w(TAG, "All points lost!");
+                    // Keep prediction
+                    prevGray.release();
+                    prevGray = currGray.clone(); // Still update gray to attempt recovery next frame
                 }
-
-                // Correct Kalman
-                Mat measurement = new Mat(3, 1, CvType.CV_32F);
-                measurement.put(0, 0, rawScale);
-                measurement.put(1, 0, currCx);
-                measurement.put(2, 0, currCy);
                 
-                Mat estimated = kalman.correct(measurement);
-                kScale = estimated.get(0, 0)[0];
-                kCx = estimated.get(1, 0)[0];
-                kCy = estimated.get(2, 0)[0];
-
+                nextPoints.release();
+                status.release();
+                err.release();
             } else {
-                Log.w(TAG, "All points lost!");
-                // Keep prediction
+                // No points, just update gray
                 prevGray.release();
-                prevGray = currGray.clone(); // Still update gray
+                prevGray = currGray.clone();
             }
-            
-            nextPoints.release();
-            status.release();
-            err.release();
         } else {
-            prevGray.release();
-            prevGray = currGray.clone();
+            // SKIPPED FRAME (PREDICT ONLY)
+            // Do NOT update prevGray, so next tracked frame compares against the old valid frame.
+            // trackerUpdated remains false
         }
         
         currGray.release(); // We cloned it to prevGray if needed
 
         
-        // 3. Sliding Window Smoothing
+        // 3. Low Pass Filter (Exponential Smoothing) instead of Sliding Window
         if (kScale > 10.0) kScale = 10.0; // Final safety clamp
         
-        scaleHistory.add(kScale);
-        cxHistory.add(kCx);
-        cyHistory.add(kCy);
+        // Apply heavy smoothing for Scale
+        smoothedScale = smoothedScale + smoothAlphaScale * (kScale - smoothedScale);
 
-        if (scaleHistory.size() > WINDOW_SIZE) {
-            scaleHistory.remove(0);
-            cxHistory.remove(0);
-            cyHistory.remove(0);
+        // Adaptive Smoothing for Position
+        // If the subject moves quickly (large difference between current and smoothed),
+        // we must increase responsiveness to prevent "drift".
+        double diffX = kCx - smoothedCx;
+        double diffY = kCy - smoothedCy;
+        double distSq = diffX*diffX + diffY*diffY;
+        
+        double dynamicAlphaPos = smoothAlphaPos;
+        // Threshold: if distance > 10 pixels (100 squared), boost alpha
+        if (distSq > 100.0) {
+            // Boost alpha based on distance. Max out at 1.0
+            // Example: dist=30px -> sq=900 -> boost=0.9
+            double boost = Math.min(1.0, distSq / 1000.0); 
+            dynamicAlphaPos = Math.max(smoothAlphaPos, boost);
+            if (dynamicAlphaPos > 1.0) dynamicAlphaPos = 1.0;
         }
 
-        double smoothScale = calculateMean(scaleHistory);
-        double smoothCx = calculateMean(cxHistory);
-        double smoothCy = calculateMean(cyHistory);
+        smoothedCx = smoothedCx + dynamicAlphaPos * diffX;
+        smoothedCy = smoothedCy + dynamicAlphaPos * diffY;
 
         // WARMUP LOGIC: Force return original frame
         if (frameCount < WARMUP_FRAMES) {
             frameCount++;
-            // Draw debug info
+            // Draw debug info (Disabled)
+            /*
             Imgproc.putText(frame, "WARMUP...", new org.opencv.core.Point(50, 50), 
                 Imgproc.FONT_HERSHEY_SIMPLEX, 1.0, new Scalar(255, 255, 0), 2);
+            */
             return frame;
         }
         
         // 4. Optimized Zoom (Crop & Resize) instead of WarpAffine
         Mat result = new Mat();
         
-        if (smoothScale > 1.0) {
+        if (smoothedScale > 1.0) {
             // Zoom In (Crop)
-            double cropW = width / smoothScale;
-            double cropH = height / smoothScale;
+            double cropW = width / smoothedScale;
+            double cropH = height / smoothedScale;
             
-            int left = (int)(smoothCx - cropW / 2.0);
-            int top = (int)(smoothCy - cropH / 2.0);
+            int left = (int)(smoothedCx - cropW / 2.0);
+            int top = (int)(smoothedCy - cropH / 2.0);
             
             // Boundary checks
             if (left < 0) left = 0;
@@ -377,13 +517,13 @@ public class DollyZoomProcessor {
             Imgproc.resize(cropMat, result, new Size(width, height), 0, 0, Imgproc.INTER_LINEAR);
             
         } else {
-            if (smoothScale < 1.0) smoothScale = 1.0;
+            if (smoothedScale < 1.0) smoothedScale = 1.0;
              frame.copyTo(result);
         }
 
         // Draw debug info
         String statusMode = trackerUpdated ? "TRACK" : "PREDICT";
-        String debugInfo = String.format("Scale: %.2f [%s]", smoothScale, statusMode);
+        String debugInfo = String.format("Scale: %.2f [%s]", smoothedScale, statusMode);
         
         // Notify listener
         if (debugListener != null) {

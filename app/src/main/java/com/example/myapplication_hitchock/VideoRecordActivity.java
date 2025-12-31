@@ -24,7 +24,6 @@ import android.widget.Button;
 
 import java.io.FileInputStream;
 import java.io.OutputStream;
-import android.widget.EditText;
 import android.widget.ImageView;
 import android.widget.SeekBar;
 import android.widget.TextView;
@@ -80,8 +79,6 @@ public class VideoRecordActivity extends AppCompatActivity {
     private ImageView fullscreenProcessedView;
     private ImageView processedImageView;
     private ImageView frozenPreviewImageView;
-    private EditText ipAddressInput;
-    private Button connectButton;
     private Button resetButton;
     private RectOverlayView rectOverlayView;
 
@@ -140,15 +137,9 @@ public class VideoRecordActivity extends AppCompatActivity {
         fullscreenProcessedView = findViewById(R.id.fullscreenProcessedView);
         processedImageView = findViewById(R.id.processedImageView);
         frozenPreviewImageView = findViewById(R.id.frozenPreviewImageView);
-        ipAddressInput = findViewById(R.id.ipAddressInput);
-        connectButton = findViewById(R.id.connectButton);
         resetButton = findViewById(R.id.resetButton);
         rectOverlayView = findViewById(R.id.rectOverlayView);
 
-        // Hide Network UI elements
-        ipAddressInput.setVisibility(View.GONE);
-        connectButton.setVisibility(View.GONE);
-        
         // Initialize Processor
         processor = new DollyZoomProcessor();
         
@@ -160,6 +151,43 @@ public class VideoRecordActivity extends AppCompatActivity {
                 }
             });
         });
+        
+        // Tracked Points Listener Removed
+
+
+        // Smoothing Control
+        TextView smoothingLabel = findViewById(R.id.smoothingLabel);
+        SeekBar smoothingSeekBar = findViewById(R.id.smoothingSeekBar);
+        
+        if (smoothingLabel != null && smoothingSeekBar != null) {
+            // Default 0.05 (Progress 5)
+            int defaultProgress = 5; 
+            smoothingSeekBar.setProgress(defaultProgress);
+            smoothingLabel.setText("Smoothing: " + defaultProgress + "%");
+            
+            smoothingSeekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                @Override
+                public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                    // Map progress 0-30 to alpha
+                    // 0 -> 0.005
+                    // 5 -> 0.05
+                    // 30 -> 0.30
+                    double alpha = progress / 100.0;
+                    if (alpha < 0.005) alpha = 0.005;
+                    
+                    if (processor != null) {
+                        processor.setSmoothingFactor(alpha);
+                    }
+                    smoothingLabel.setText("Smoothing: " + progress + "%");
+                }
+
+                @Override
+                public void onStartTrackingTouch(SeekBar seekBar) {}
+
+                @Override
+                public void onStopTrackingTouch(SeekBar seekBar) {}
+            });
+        }
 
         // Track Interval Control
         TextView intervalLabel = findViewById(R.id.intervalLabel);
@@ -167,7 +195,7 @@ public class VideoRecordActivity extends AppCompatActivity {
 
         if (intervalLabel != null && intervalSeekBar != null) {
             // Initial state (match default in Processor or desired default)
-            int defaultInterval = 4;
+            int defaultInterval = 1; // Default to 1 (Every frame) for best stabilization
             intervalSeekBar.setProgress(defaultInterval - 1); // 0-based
             intervalLabel.setText("Track Interval: " + defaultInterval);
             processor.setTrackingInterval(defaultInterval);
@@ -272,11 +300,17 @@ public class VideoRecordActivity extends AppCompatActivity {
         videoCaptureButton.setOnClickListener(v -> {
             if (!isRecording) {
                 isRecording = true;
-                videoCaptureButton.setText("Stop Recording");
+                // Visual feedback: Darker red or square shape (simulated by scale or color)
+                videoCaptureButton.setBackgroundTintList(android.content.res.ColorStateList.valueOf(0xFF880000)); 
+                videoCaptureButton.setScaleX(0.8f);
+                videoCaptureButton.setScaleY(0.8f);
                 Toast.makeText(this, "Recording Started", Toast.LENGTH_SHORT).show();
             } else {
                 isRecording = false;
-                videoCaptureButton.setText("Start Recording");
+                // Visual feedback: Restore
+                videoCaptureButton.setBackgroundTintList(android.content.res.ColorStateList.valueOf(0xFFFF4444));
+                videoCaptureButton.setScaleX(1.0f);
+                videoCaptureButton.setScaleY(1.0f);
                 // Force stop recording immediately
                 stopRecording();
             }
