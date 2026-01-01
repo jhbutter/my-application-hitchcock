@@ -302,6 +302,24 @@ public class DollyZoomProcessor {
         double kCx = predCx;
         double kCy = predCy;
         
+        // SAFETY: If we have no points to track, we must NOT use the prediction blindly.
+        // This covers skipped frames (trackingInterval) and persistent loss.
+        if (prevPoints.total() == 0) {
+            kScale = smoothedScale;
+            kCx = smoothedCx;
+            kCy = smoothedCy;
+            
+            // Also reset Kalman velocities to 0 to prevent internal drift
+            Mat statePost = kalman.get_statePost();
+            statePost.put(3, 0, 0.0);
+            statePost.put(4, 0, 0.0);
+            statePost.put(5, 0, 0.0);
+            statePost.put(0, 0, smoothedScale);
+            statePost.put(1, 0, smoothedCx);
+            statePost.put(2, 0, smoothedCy);
+            kalman.set_statePost(statePost);
+        }
+        
         boolean trackerUpdated = false;
 
         // 2. Optical Flow Tracking (Every frame if possible, or skip logic)
@@ -345,82 +363,81 @@ public class DollyZoomProcessor {
                 }
                 */
 
+                // 3. Tracking Validity & Kalman Update
+                boolean isValidTracking = false;
+                double rawScale = 1.0;
+                double currCx = 0;
+                double currCy = 0;
+
                 if (goodNewPoints.size() > 0) {
-                    trackerUpdated = true;
-                    
-                    // Update prevPoints and prevGray
-                    prevPoints.fromList(goodNewPoints);
-                    prevGray.release();
-                    prevGray = currGray.clone(); // Keep current as prev for next iter
-                    
                     // Calculate Bounding Box
-                    // We use bounding rect of points
                     MatOfPoint pointsMat = new MatOfPoint();
                     pointsMat.fromList(goodNewPoints);
-                    trackRect = Imgproc.boundingRect(pointsMat);
+                    Rect newTrackRect = Imgproc.boundingRect(pointsMat);
                     pointsMat.release();
-                    
-                    // Notify Listener
-                    /*
-                    if (pointsListener != null) {
-                        pointsListener.onTrackedPoints(goodNewPoints, trackRect, width, height);
-                    }
-                    */
 
-                    // 3. Kalman Update
-                    
-                    // Robust Measurement Calculation:
-                    // 1. Position: Use Median of tracked points (Robust to outliers)
+                    // Calculate Median Position
                     List<Double> xCoords = new ArrayList<>();
                     List<Double> yCoords = new ArrayList<>();
                     for (Point p : goodNewPoints) {
                         xCoords.add(p.x);
                         yCoords.add(p.y);
                     }
-                    double currCx = calculateMedian(xCoords);
-                    double currCy = calculateMedian(yCoords);
+                    currCx = calculateMedian(xCoords);
+                    currCy = calculateMedian(yCoords);
+
+                    // Calculate Geometry Metrics for Degeneracy Check
+                    double currentDiagonal = Math.sqrt(newTrackRect.width * newTrackRect.width + newTrackRect.height * newTrackRect.height);
                     
-                    // 2. Scale: Use Weighted Average of Bounding Box and Average Radius
-                    // Bounding Box is stable but can be insensitive if only internal points move.
-                    // Average Radius is sensitive but noisy.
-                    // Mix: 70% Bounding Box (Stability) + 30% Average Radius (Responsiveness)
-                    
-                    // A. Bounding Box Scale
-                    double currentDiagonal = Math.sqrt(trackRect.width * trackRect.width + trackRect.height * trackRect.height);
-                    double scaleBox = 1.0;
-                    if (currentDiagonal > 10.0) {
-                        scaleBox = initDiagonal / currentDiagonal;
-                    }
-                    
-                    // B. Average Radius Scale
                     double currentSumDist = 0;
                     for (Point p : goodNewPoints) {
                         double dx = p.x - currCx;
                         double dy = p.y - currCy;
                         currentSumDist += Math.sqrt(dx*dx + dy*dy);
                     }
-                    double currentAvgRadius = (goodNewPoints.size() > 0) ? currentSumDist / goodNewPoints.size() : 1.0;
-                    if (currentAvgRadius < 1.0) currentAvgRadius = 1.0;
-                    
-                    double scaleRadius = 1.0;
-                    if (initAvgRadius > 1.0) {
-                        scaleRadius = initAvgRadius / currentAvgRadius;
-                    }
-                    
-                    // C. Mix
-                    double rawScale = 0.7 * scaleBox + 0.3 * scaleRadius;
-                    
-                    // Sanity Check
-                    if (rawScale > 10.0 || rawScale < 0.1) {
-                         // Limit
-                         if (rawScale > 10.0) rawScale = 10.0;
-                         if (rawScale < 0.1) rawScale = 0.1;
-                    }
-                    
-                    // Clamping
-                    if (rawScale > 10.0) rawScale = 10.0;
-                    if (rawScale < 0.5) rawScale = 0.5;
+                    double currentAvgRadius = (goodNewPoints.size() > 0) ? currentSumDist / goodNewPoints.size() : 0.0;
 
+                    // Degeneracy Check:
+                    // If points collapse to a small cluster (radius < 10) or box is too small (diagonal < 20),
+                    // tracking is likely failing or locking onto noise.
+                    if (currentDiagonal > 20.0 && currentAvgRadius > 10.0) {
+                        isValidTracking = true;
+                        
+                        // Valid Tracking -> Update State
+                        trackRect = newTrackRect;
+                        trackerUpdated = true;
+
+                        // Update prevPoints and prevGray
+                        prevPoints.fromList(goodNewPoints);
+                        prevGray.release();
+                        prevGray = currGray.clone();
+
+                        // Calculate Scale
+                        // A. Bounding Box Scale
+                        double scaleBox = 1.0;
+                        if (currentDiagonal > 10.0) {
+                            scaleBox = initDiagonal / currentDiagonal;
+                        }
+                        
+                        // B. Average Radius Scale
+                        double scaleRadius = 1.0;
+                        if (initAvgRadius > 1.0 && currentAvgRadius > 1.0) {
+                            scaleRadius = initAvgRadius / currentAvgRadius;
+                        }
+                        
+                        // C. Mix
+                        rawScale = 0.7 * scaleBox + 0.3 * scaleRadius;
+                        
+                        // Clamping
+                        if (rawScale > 10.0) rawScale = 10.0;
+                        if (rawScale < 0.5) rawScale = 0.5;
+                    } else {
+                        Log.w(TAG, "Tracking degenerate! Diag=" + currentDiagonal + ", Radius=" + currentAvgRadius);
+                        isValidTracking = false;
+                    }
+                }
+
+                if (isValidTracking) {
                     // Correct Kalman
                     Mat measurement = new Mat(3, 1, CvType.CV_32F);
                     measurement.put(0, 0, rawScale);
@@ -431,19 +448,75 @@ public class DollyZoomProcessor {
                     kScale = estimated.get(0, 0)[0];
                     kCx = estimated.get(1, 0)[0];
                     kCy = estimated.get(2, 0)[0];
-
                 } else {
-                    Log.w(TAG, "All points lost!");
-                    // Keep prediction
+                    Log.w(TAG, "Tracking Lost or Degenerate!");
+                    // Tracking Lost Logic:
+                    // 1. Do NOT use Kalman prediction blindly as it might drift (e.g. infinite zoom)
+                    // 2. Force reset prediction velocity or hold last known good values
+                    
+                    // Reset Kalman state to stop velocity accumulation
+                    Mat statePost = kalman.get_statePost();
+                    // Set velocity (indices 3,4,5) to 0
+                    statePost.put(3, 0, 0.0);
+                    statePost.put(4, 0, 0.0);
+                    statePost.put(5, 0, 0.0);
+                    // Set position/scale to smoothed values to prevent jump
+                    statePost.put(0, 0, smoothedScale);
+                    statePost.put(1, 0, smoothedCx);
+                    statePost.put(2, 0, smoothedCy);
+                    kalman.set_statePost(statePost);
+                    
+                    // Use smoothed values as "current" to freeze effect
+                    kScale = smoothedScale;
+                    kCx = smoothedCx;
+                    kCy = smoothedCy;
+
+                    // Do NOT update prevPoints (keep old points for recovery)
+                    // Do NOT update prevGray (keep old gray for recovery against old points)
+                    // Wait, if we don't update prevGray, next frame compares NEW frame with VERY OLD frame.
+                    // This is good if the object temporarily disappeared.
+                    // But if the camera moved significantly, the old points won't match anyway.
+                    // Still, better than updating to a "bad" frame.
+                    
+                    // HOWEVER, if we are in "Persistent Loss", we might need to update prevGray to current
+                    // to avoid getting stuck in the past?
+                    // No, prevPoints corresponds to prevGray. We must keep them in sync.
+                    // If we don't update prevPoints, we shouldn't update prevGray.
+                    
+                    // But wait, the original code did:
+                    // prevGray.release();
+                    // prevGray = currGray.clone();
+                    
+                    // If I remove this, prevGray stays old.
+                    // Let's keep the original "Recovery" strategy for now, but ensure SCALE is frozen.
+                    
+                    // Actually, if we update prevGray but keep old prevPoints, Optical Flow will try to find
+                    // old points in new image. This is standard LK.
                     prevGray.release();
-                    prevGray = currGray.clone(); // Still update gray to attempt recovery next frame
+                    prevGray = currGray.clone(); 
                 }
                 
                 nextPoints.release();
                 status.release();
                 err.release();
             } else {
-                // No points, just update gray
+                // No prevPoints to track from
+                Log.w(TAG, "No points to track from!");
+                
+                // Freeze Scale logic
+                Mat statePost = kalman.get_statePost();
+                statePost.put(3, 0, 0.0);
+                statePost.put(4, 0, 0.0);
+                statePost.put(5, 0, 0.0);
+                statePost.put(0, 0, smoothedScale);
+                statePost.put(1, 0, smoothedCx);
+                statePost.put(2, 0, smoothedCy);
+                kalman.set_statePost(statePost);
+                
+                kScale = smoothedScale;
+                kCx = smoothedCx;
+                kCy = smoothedCy;
+
                 prevGray.release();
                 prevGray = currGray.clone();
             }
@@ -493,33 +566,93 @@ public class DollyZoomProcessor {
             return frame;
         }
         
-        // 4. Optimized Zoom (Crop & Resize) instead of WarpAffine
+        // 4. Optimized Zoom (WarpAffine) for Sub-pixel Accuracy and Centering with Progressive Centering
         Mat result = new Mat();
         
-        if (smoothedScale > 1.0) {
-            // Zoom In (Crop)
-            double cropW = width / smoothedScale;
-            double cropH = height / smoothedScale;
-            
-            int left = (int)(smoothedCx - cropW / 2.0);
-            int top = (int)(smoothedCy - cropH / 2.0);
-            
-            // Boundary checks
-            if (left < 0) left = 0;
-            if (top < 0) top = 0;
-            if (left + cropW > width) left = width - (int)cropW;
-            if (top + cropH > height) top = height - (int)cropH;
-            
-            Rect cropRect = new Rect(left, top, (int)cropW, (int)cropH);
-            
-            // Fast Submat + Resize
-            Mat cropMat = new Mat(frame, cropRect);
-            Imgproc.resize(cropMat, result, new Size(width, height), 0, 0, Imgproc.INTER_LINEAR);
-            
-        } else {
-            if (smoothedScale < 1.0) smoothedScale = 1.0;
-             frame.copyTo(result);
+        // --- PROGRESSIVE CENTERING LOGIC ---
+        // Goal: Avoid sudden jump at start by interpolating between Initial Object Position and Screen Center.
+        
+        double maxScaleThreshold = 2.0; // At 2.0x scale, object is fully centered
+        double t = (smoothedScale - 1.0) / (maxScaleThreshold - 1.0);
+        
+        // Clamp t to [0, 1]
+        if (t < 0.0) t = 0.0;
+        if (t > 1.0) t = 1.0;
+        
+        // Calculate Dynamic Target Center (Progressive Centering)
+        double screenCx = width / 2.0;
+        double screenCy = height / 2.0;
+        
+        double idealTargetCx = (1.0 - t) * initCx + t * screenCx;
+        double idealTargetCy = (1.0 - t) * initCy + t * screenCy;
+
+        // --- SAFE AREA CLAMPING (Prevents Out of Bounds / Garbage Rendering) ---
+        // Calculate safe movement range for the center point based on current scale and object position
+        
+        // Correct logic for Safe Zone when scaling around an arbitrary point (smoothedCx, smoothedCy):
+        // 1. Calculate the distance from the object center to the four edges of the source image.
+        double distLeft = smoothedCx;
+        double distRight = width - smoothedCx;
+        double distTop = smoothedCy;
+        double distBottom = height - smoothedCy;
+        
+        // 2. Scale these distances to find the size of the transformed image relative to the center.
+        double scaledDistLeft = distLeft * smoothedScale;
+        double scaledDistRight = distRight * smoothedScale;
+        double scaledDistTop = distTop * smoothedScale;
+        double scaledDistBottom = distBottom * smoothedScale;
+        
+        // 3. Determine the valid range for targetCx/targetCy such that the screen is fully covered.
+        // Screen [0, width] must be covered by [targetCx - scaledDistLeft, targetCx + scaledDistRight]
+        // Left Edge Constraint: targetCx - scaledDistLeft <= 0  =>  targetCx <= scaledDistLeft
+        // Right Edge Constraint: targetCx + scaledDistRight >= width  =>  targetCx >= width - scaledDistRight
+        
+        double minSafeX = width - scaledDistRight;
+        double maxSafeX = scaledDistLeft;
+        double minSafeY = height - scaledDistBottom;
+        double maxSafeY = scaledDistTop;
+        
+        // Handle case where scale < 1.0 (should not happen in Hitchcock, but safe to handle)
+        // Or if the image, even after scaling, is smaller than the screen (e.g. tracking extreme edge with low zoom)
+        // In these cases, minSafe > maxSafe. We must accept borders.
+        // We prioritize centering the available image content or sticking to the clamp.
+        // If minSafe > maxSafe, we just clamp to the average (center of the valid range)
+        if (minSafeX > maxSafeX) {
+             // Image width < Screen Width. Center it horizontally.
+             minSafeX = maxSafeX = screenCx;
         }
+        if (minSafeY > maxSafeY) {
+             // Image height < Screen Height. Center it vertically.
+             minSafeY = maxSafeY = screenCy;
+        }
+        
+        // Clamp Ideal Target to Safe Zone
+        double targetCx = Math.max(minSafeX, Math.min(maxSafeX, idealTargetCx));
+        double targetCy = Math.max(minSafeY, Math.min(maxSafeY, idealTargetCy));
+        
+        // Calculate Transformation Matrix
+        Point center = new Point(smoothedCx, smoothedCy);
+        
+        // Use smoothedScale directly
+        Mat M = Imgproc.getRotationMatrix2D(center, 0, smoothedScale);
+        
+        // Calculate Translation to move 'center' (smoothedCx, smoothedCy) to 'targetCenter' (targetCx, targetCy)
+        // Tx = DestinationX - SourceX
+        double tx = targetCx - smoothedCx;
+        double ty = targetCy - smoothedCy;
+        
+        double[] m02 = M.get(0, 2);
+        double[] m12 = M.get(1, 2);
+        m02[0] += tx;
+        m12[0] += ty;
+        M.put(0, 2, m02);
+        M.put(1, 2, m12);
+        
+        // Apply WarpAffine with BORDER_REPLICATE
+        // This handles edges gracefully without hard black borders or forced zoom
+        Imgproc.warpAffine(frame, result, M, new Size(width, height), Imgproc.INTER_LINEAR, Core.BORDER_REPLICATE, new Scalar(0, 0, 0));
+        
+        M.release();
 
         // Draw debug info
         String statusMode = trackerUpdated ? "TRACK" : "PREDICT";

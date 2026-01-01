@@ -80,7 +80,10 @@ public class VideoRecordActivity extends AppCompatActivity {
     private ImageView processedImageView;
     private ImageView frozenPreviewImageView;
     private Button resetButton;
+    private Button switchCameraButton;
     private RectOverlayView rectOverlayView;
+
+    private int cameraFacing = CameraSelector.LENS_FACING_BACK;
 
     private DollyZoomProcessor processor;
     private boolean isProcessing = false;
@@ -138,10 +141,22 @@ public class VideoRecordActivity extends AppCompatActivity {
         processedImageView = findViewById(R.id.processedImageView);
         frozenPreviewImageView = findViewById(R.id.frozenPreviewImageView);
         resetButton = findViewById(R.id.resetButton);
+        switchCameraButton = findViewById(R.id.switchCameraButton);
         rectOverlayView = findViewById(R.id.rectOverlayView);
 
         // Initialize Processor
         processor = new DollyZoomProcessor();
+
+        if (switchCameraButton != null) {
+            switchCameraButton.setOnClickListener(v -> {
+                if (cameraFacing == CameraSelector.LENS_FACING_BACK) {
+                    cameraFacing = CameraSelector.LENS_FACING_FRONT;
+                } else {
+                    cameraFacing = CameraSelector.LENS_FACING_BACK;
+                }
+                startCamera();
+            });
+        }
         
         TextView debugInfoText = findViewById(R.id.debugInfoText);
         processor.setOnDebugInfoListener(info -> {
@@ -361,7 +376,9 @@ public class VideoRecordActivity extends AppCompatActivity {
                 ImageAnalysis imageAnalysis = builder.build();
                 imageAnalysis.setAnalyzer(cameraExecutor, this::analyzeImage);
 
-                CameraSelector cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA;
+                CameraSelector cameraSelector = new CameraSelector.Builder()
+                        .requireLensFacing(cameraFacing)
+                        .build();
 
                 try {
                     cameraProvider.unbindAll();
