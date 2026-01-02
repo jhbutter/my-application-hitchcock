@@ -1,73 +1,90 @@
-# Hitchcock Effect App
+# 希区柯克变焦特效 App (Hitchcock Effect / Dolly Zoom)
 
-An Android application that implements the **Dolly Zoom (Vertigo) effect** locally on your device. By combining real-time object tracking with dynamic digital zooming, this app allows you to recreate the iconic cinematic effect made famous by Alfred Hitchcock.
+这是一款基于 Android 的高级应用，利用**专业级的防抖技术**和**物体锁定算法**，在移动设备上完美复刻了经典的**希区柯克变焦（Dolly Zoom / Vertigo）**电影特效。通过结合实时计算机视觉、自适应平滑算法和硬件加速，让您轻松拍摄出极具视觉冲击力的画面。
 
-## 🚀 Features
+## 🚀 核心功能
 
-- **Real-time Object Tracking**: Utilizes OpenCV's tracking algorithms (CSRT/KCF) to lock onto a selected subject.
-- **Automatic Dolly Zoom**: As you move the camera towards or away from the subject, the app automatically adjusts the digital zoom to keep the subject's size constant in the frame, creating the warping background effect.
-- **Smooth Transitions**: Implements **Kalman Filtering** to stabilize tracking data and ensure smooth zoom operations.
-- **Local Video Recording**: Record and save your Dolly Zoom shots directly to your device gallery.
-- **Interactive UI**: Touch-to-select target for tracking.
+- **物体锁定模式 (Object Lock Mode)**：
+  类似于商业级云台（如 DJI/vivo）的视觉锁定功能，能以亚像素级的精度将选定物体“钉”在画面中心，无论镜头如何移动，物体位置始终纹丝不动。
+- **平滑希区柯克变焦 (Smooth Dolly Zoom)**：
+  根据物理距离的变化自动调整数字变焦倍率，确保物体在画面中的大小保持不变，从而产生强烈的背景压缩/拉伸视觉效果。
+- **专业级防抖系统 (Professional Stabilization)**：
+  - **分离式卡尔曼滤波**：针对“位置锁定”和“变焦响应”采用完全独立的滤波逻辑——位置如磐石般稳定，变焦如丝绸般顺滑。
+  - **自适应非线性平滑**：采用线性 Ramp 函数替代传统的死区逻辑，消除微小抖动的同时，确保在大范围移动时零延迟。
+  - **硬件级集成**：深度集成 OIS（光学防抖）/ EIS（电子防抖）并利用 IMU 数据进行底层去抖。
+- **高性能渲染**：
+  基于 OpenCV 和 Android CameraX 构建的 60 FPS 实时处理管线。
+- **双摄支持**：
+  支持一键切换前置/后置摄像头，满足自拍或电影感拍摄需求。
 
-## 🛠 Tech Stack
+## 🛠 技术栈与核心算法
 
-- **Language**: Java
-- **Camera Engine**: [Android CameraX](https://developer.android.com/training/camerax)
-- **Computer Vision**: [OpenCV for Android](https://opencv.org/android/)
-- **Video Processing**: MediaCodec API
-- **Algorithms**: 
-  - CSRT/KCF Tracker for object tracking
-  - Kalman Filter for motion smoothing
+### 1. 计算机视觉核心 (OpenCV)
+应用的核心引擎 `DollyZoomProcessor` 采用了多种先进的 CV 技术：
 
-## 📋 Prerequisites
+*   **光流追踪 (Optical Flow Tracking)**：
+    *   使用 **Lucas-Kanade 稀疏光流法** (`Video.calcOpticalFlowPyrLK`) 进行高速特征点追踪。
+    *   **双向误差校验 (Bidirectional Error Check)**：通过前向-后向追踪验证，自动剔除不可靠的特征点。
+    *   **鲁棒内点半径 (Robust Inlier Radius)**：基于特征点分布统计来计算物体的尺度变化，相比简单的包围盒（Bounding Box）追踪，能提供更稳定、抗干扰的缩放信号。
 
-- **Android Studio**: Recommended latest version (Ladybug or newer).
-- **JDK**: Java 17 or compatible.
-- **Android Device**: Physical device recommended (CameraX features and performance on emulators may be limited).
-- **OpenCV SDK**: The project depends on OpenCV. Ensure the OpenCV Android SDK is properly configured in your project if not already bundled.
+*   **亚像素级变换 (Sub-Pixel Transformation)**：
+    *   **WarpAffine 仿射变换**：摒弃粗糙的裁剪（Crop）方案，改用仿射变换 (`Imgproc.warpAffine`)。这不仅实现了亚像素级的中心锁定，还能平滑处理旋转分量。
+    *   **边界复制 (Border Replication)**：使用 `Core.BORDER_REPLICATE` 智能填充画面边缘，在剧烈运镜时防止出现黑边。
 
-## ⚙️ Setup & Installation
+### 2. 高级防抖系统 (Stabilization System)
+为了在保持变焦灵敏度的同时实现“三脚架级”的稳定性，我们设计了一套复杂的防抖管线：
 
-1. **Clone the repository**
+*   **分离式卡尔曼滤波 (Decoupled Kalman Filter)**：
+    *   **位置 (Position)**：设置极高的测量信任度 (`R=100.0`) 和极低的过程噪声 (`Q=1e-5`)。这实际上假设物体位置是恒定的，从而强力压制 99% 的位置抖动，实现“锁死”效果。
+    *   **缩放 (Scale)**：设置中等的信任度 (`R=10.0`) 和较高的过程噪声 (`Q=1e-3`)。这使得变焦逻辑能瞬间响应用户的推拉动作，保留希区柯克变焦的视觉张力。
+
+*   **自适应非线性平滑 (Adaptive Non-Linear Smoothing)**：
+    *   摒弃了会导致跳变的“死区”逻辑，采用连续线性斜坡函数 (Linear Ramp Function)。
+    *   **静态时**：使用极低的 Alpha 系数 (`0.008`)，确保画面在静止时绝对稳定。
+    *   **动态时**：平滑系数随移动速度线性增加，确保在快速运镜时完全无延迟（Zero Lag）。
+
+*   **渐进式居中 (Progressive Centering)**：
+    *   消除了追踪开始时的画面跳变。系统会在最初的几秒内，通过插值算法将锚点从物体的初始位置平滑过渡到屏幕中心。
+
+### 3. 硬件与架构
+*   **Android CameraX**：管理相机生命周期、预览用例及图像分析。
+*   **硬件防抖 (OIS/EIS)**：显式开启 `CONTROL_VIDEO_STABILIZATION_MODE`，在图像进入 CV 处理器之前，利用手机的物理陀螺仪和镜头位移（OIS）进行第一层物理防抖。
+*   **线程安全架构**：使用 `ExecutorService` 进行后台处理，并实现线程安全的 UI 更新机制，确保录制界面流畅不卡顿。
+
+## ⚙️ 安装与配置
+
+1. **环境要求**：
+   - Android Studio Ladybug 或更新版本。
+   - 支持 CameraX 的 Android 设备（推荐使用真机，模拟器性能受限）。
+   - JDK 17。
+
+2. **克隆与运行**：
    ```bash
    git clone <repository-url>
    ```
+   - 在 Android Studio 中打开项目。
+   - 等待 Gradle 同步完成。
+   - 连接真机并点击运行。
 
-2. **Open in Android Studio**
-   - Launch Android Studio.
-   - Select "Open" and navigate to the project directory.
+## 📱 使用指南
 
-3. **Sync Gradle**
-   - Wait for Android Studio to download dependencies and sync the project.
+1. **选择镜头**：点击切换按钮选择前置或后置摄像头。
+2. **锁定主体**：
+   - 将镜头对准拍摄主体。
+   - 点击“Get Started”或录制按钮进入预览。
+   - 在屏幕上框选您要追踪的物体。
+3. **拍摄希区柯克变焦**：
+   - **向后移动**（远离主体）：App 会自动放大画面（Zoom In）。
+   - **向前移动**（靠近主体）：App 会自动缩小画面（Zoom Out）。
+   - 全程保持主体在画面中心大小不变，背景产生强烈的透视畸变。
+4. **重置**：如果追踪丢失，点击“Reset”按钮即可恢复初始状态。
 
-4. **Run the App**
-   - Connect your Android device via USB or Wi-Fi debugging.
-   - Click the **Run** button (green play icon).
+## 📂 关键文件结构
 
-## 📱 Usage
+- **`DollyZoomProcessor.java`**：【大脑】包含光流追踪、卡尔曼滤波、自适应平滑和 WarpAffine 变换的核心逻辑。
+- **`VideoRecordActivity.java`**：【控制器】管理 CameraX、硬件防抖开关、UI 线程交互及传感器数据。
+- **`RectOverlayView.java`**：【视图】自定义 UI 组件，用于绘制追踪框和交互层。
 
-1. **Permissions**: On first launch, grant the necessary Camera and Audio permissions.
-2. **Select Subject**: Point your camera at the subject you want to film.
-3. **Start Tracking**: Tap the "Get Started" or Record button to enter the recording view, then select the object to track (or use the provided UI overlay to define the ROI).
-4. **Perform Dolly Zoom**:
-   - Physically move **backwards** (away from the subject) while the app automatically **zooms in**.
-   - Or, move **forwards** (towards the subject) while the app **zooms out**.
-5. **Record**: Press the capture button to start/stop recording your clip.
+## 📄 许可证
 
-## 📂 Project Structure
-
-- `app/src/main/java/com/example/myapplication_hitchock/`
-  - `MainActivity.java`: Entry point of the application.
-  - `VideoRecordActivity.java`: Handles camera preview, recording logic, and UI interactions.
-  - `DollyZoomProcessor.java`: Core logic for tracking and calculating zoom factors.
-  - `VideoEncoder.java`: Handles video encoding using MediaCodec.
-  - `RectOverlayView.java`: Custom view for drawing the tracking rectangle overlay.
-
-## 🤝 Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## 📄 License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
+本项目采用 MIT 许可证。

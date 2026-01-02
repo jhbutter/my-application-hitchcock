@@ -65,7 +65,11 @@ import java.util.Map;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import android.hardware.camera2.CameraCaptureSession;
 import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.CaptureResult;
+import android.hardware.camera2.TotalCaptureResult;
+import androidx.annotation.NonNull;
 
 public class VideoRecordActivity extends AppCompatActivity {
 
@@ -73,6 +77,10 @@ public class VideoRecordActivity extends AppCompatActivity {
 
     private ExecutorService cameraExecutor;
     private ExecutorService processExecutor;
+    
+    // UI Elements
+    private TextView debugInfoText;
+    private volatile String stabilizationStatusString = "EIS: ? | OIS: ?"; // Thread-safe string container
 
     private PreviewView viewFinder;
     private Button videoCaptureButton;
@@ -159,10 +167,13 @@ public class VideoRecordActivity extends AppCompatActivity {
         }
         
         TextView debugInfoText = findViewById(R.id.debugInfoText);
+        this.debugInfoText = debugInfoText;
+        
         processor.setOnDebugInfoListener(info -> {
             runOnUiThread(() -> {
                 if (debugInfoText != null) {
-                    debugInfoText.setText(info);
+                    // Append Stabilization Info if available
+                    debugInfoText.setText(info + "\n" + stabilizationStatusString);
                 }
             });
         });
@@ -371,7 +382,34 @@ public class VideoRecordActivity extends AppCompatActivity {
                         .setTargetResolution(new Size(640, 480)); // VGA resolution for higher FPS
 
                 Camera2Interop.Extender<ImageAnalysis> extender = new Camera2Interop.Extender<>(builder);
-                extender.setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, new Range<>(60, 60));
+                // Relax FPS range to [30, 60] to accommodate Hardware Stabilization (EIS)
+                // EIS often forces 30fps on some devices. Forcing 60fps might cause drops or failures.
+                extender.setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, new Range<>(30, 60));
+                
+                // Enable Video Stabilization (EIS/OIS) to use IMU data for stabilizing the feed
+                // This significantly reduces source jitter before OpenCV processing
+                extender.setCaptureRequestOption(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON);
+                extender.setCaptureRequestOption(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON);
+
+                // Add Capture Callback to Verify Stabilization Status
+                extender.setSessionCaptureCallback(new CameraCaptureSession.CaptureCallback() {
+                    @Override
+                    public void onCaptureCompleted(@NonNull CameraCaptureSession session, @NonNull CaptureRequest request, @NonNull TotalCaptureResult result) {
+                        super.onCaptureCompleted(session, request, result);
+                        
+                        Integer videoStabMode = result.get(CaptureResult.CONTROL_VIDEO_STABILIZATION_MODE);
+                        Integer opticalStabMode = result.get(CaptureResult.LENS_OPTICAL_STABILIZATION_MODE);
+                        
+                        String stabStatus = "EIS: " + (videoStabMode != null && videoStabMode == CaptureResult.CONTROL_VIDEO_STABILIZATION_MODE_ON ? "ON" : "OFF") + 
+                                          " | OIS: " + (opticalStabMode != null && opticalStabMode == CaptureResult.LENS_OPTICAL_STABILIZATION_MODE_ON ? "ON" : "OFF");
+                        
+                        // Update status string
+                        if (!stabilizationStatusString.equals(stabStatus)) {
+                             stabilizationStatusString = stabStatus;
+                             Log.d(TAG, "Stabilization Status: " + stabStatus);
+                        }
+                    }
+                });
 
                 ImageAnalysis imageAnalysis = builder.build();
                 imageAnalysis.setAnalyzer(cameraExecutor, this::analyzeImage);

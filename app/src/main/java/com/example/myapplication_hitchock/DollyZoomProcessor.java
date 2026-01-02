@@ -68,11 +68,10 @@ public class DollyZoomProcessor {
         
         this.smoothAlphaScale = alpha;
         // Position Smoothing Logic for "Lock" Stabilization:
-        // To achieve "Visual Stabilization" (keeping the subject fixed in center),
-        // the position tracking needs to be much more responsive (higher alpha) than the scale smoothing.
-        // If position alpha is too low, the subject will "drift" or "float" when the camera moves.
-        // We ensure a minimum responsiveness (0.5) to keep the lock tight.
-        this.smoothAlphaPos = Math.max(alpha * 5.0, 0.5);
+        // Lower alpha = Smoother (Less Jitter), Higher alpha = More Responsive (Less Drift)
+        // Previous value 0.5 was too high, causing jitter.
+        // Now using a more balanced value.
+        this.smoothAlphaPos = Math.max(alpha * 2.0, 0.1);
         
         if (this.smoothAlphaPos > 1.0) this.smoothAlphaPos = 1.0;
         
@@ -119,11 +118,16 @@ public class DollyZoomProcessor {
         Log.d(TAG, "Tracking Interval set to: " + interval);
     }
 
+    // Tracked Center (Flow-based) to avoid centroid jumps
+    private double trackedCx;
+    private double trackedCy;
+
     public void init(Mat frame, android.graphics.RectF initialRect) {
         width = frame.cols();
         height = frame.rows();
+        
+        // ... (rest of init)
 
-        // Validate Initial Rect
         if (initialRect.width() < 10 || initialRect.height() < 10) {
             Log.e(TAG, "Initial Rect too small: " + initialRect);
             isInitialized = false;
@@ -179,7 +183,12 @@ public class DollyZoomProcessor {
         smoothedCy = initCy;
         smoothedScale = 1.0;
         
+        // Initialize Tracked Center
+        trackedCx = initCx;
+        trackedCy = initCy;
+        
         // Calculate Initial Radius (Centroid based)
+
         Point[] points = corners.toArray(); // corners is released above but we can use prevPoints
         Point[] pts = prevPoints.toArray();
         double sumDist = 0;
@@ -220,25 +229,30 @@ public class DollyZoomProcessor {
         measurementMatrix.put(2, 2, 1);
         kalman.set_measurementMatrix(measurementMatrix);
 
-        // Process Noise Covariance (Q) - RESPONSIVE STABILIZATION
+        // Process Noise Covariance (Q) - ULTRA SMOOTH STABILIZATION
         Mat processNoiseCov = Mat.eye(6, 6, CvType.CV_32F);
-        // Scale: Low noise, smooth zoom
-        processNoiseCov.put(0, 0, 1e-4);
-        // Position: High noise allowed (We expect the subject to move in the frame)
-        // Was 1e-6 (Stationary assumption), now 1e-2 to allow tracking fast motion
-        processNoiseCov.put(1, 1, 1e-2);
-        processNoiseCov.put(2, 2, 1e-2);
+        // Scale: Moderate noise to allow zoom response
+        processNoiseCov.put(0, 0, 1e-3);
+        // Position: Extremely low noise to assume constant position (Lock mode)
+        // Was 1e-3 -> Now 1e-5
+        processNoiseCov.put(1, 1, 1e-5);
+        processNoiseCov.put(2, 2, 1e-5);
         // Velocities:
-        processNoiseCov.put(3, 3, 1e-2);
-        processNoiseCov.put(4, 4, 1e-2);
-        processNoiseCov.put(5, 5, 1e-2);
+        processNoiseCov.put(3, 3, 1e-4);
+        processNoiseCov.put(4, 4, 1e-4);
+        processNoiseCov.put(5, 5, 1e-4);
         kalman.set_processNoiseCov(processNoiseCov);
 
-        // Measurement Noise Covariance (R) - TRUST MEASUREMENT
+        // Measurement Noise Covariance (R) - DECOUPLED STABILITY
         Mat measurementNoiseCov = Mat.eye(3, 3, CvType.CV_32F);
-        // Reduce noise covariance to trust the Optical Flow result more.
-        // Was 10.0 -> Now 1.0 (Standard trust)
-        Core.multiply(measurementNoiseCov, new Scalar(1.0), measurementNoiseCov);
+        
+        // Scale: Moderate Trust (10.0) -> Responsive Zoom
+        measurementNoiseCov.put(0, 0, 10.0);
+        
+        // Position: High Trust in Model (100.0) -> Rock Solid Lock (No Jitter)
+        measurementNoiseCov.put(1, 1, 100.0);
+        measurementNoiseCov.put(2, 2, 100.0);
+        
         kalman.set_measurementNoiseCov(measurementNoiseCov);
 
         // Initial State
@@ -376,28 +390,66 @@ public class DollyZoomProcessor {
                     Rect newTrackRect = Imgproc.boundingRect(pointsMat);
                     pointsMat.release();
 
-                    // Calculate Median Position
-                    List<Double> xCoords = new ArrayList<>();
-                    List<Double> yCoords = new ArrayList<>();
-                    for (Point p : goodNewPoints) {
-                        xCoords.add(p.x);
-                        yCoords.add(p.y);
+                    // FLOW-BASED TRACKING UPDATE (Prevents Centroid Jumps)
+                    // Calculate median flow from prevPoints to goodNewPoints
+                    List<Double> flowsX = new ArrayList<>();
+                    List<Double> flowsY = new ArrayList<>();
+                    
+                    // Note: goodNewPoints corresponds to nextList indices where status=1
+                    // But we need the corresponding PREVIOUS points to calculate flow.
+                    // We must iterate statusList again to match pairs.
+                    
+                    // Re-match pairs for flow calculation
+                    int goodIdx = 0;
+                    for (int i = 0; i < statusList.size(); i++) {
+                        if (statusList.get(i) == 1) {
+                            Point prevP = prevList.get(i);
+                            Point nextP = nextList.get(i); // This is goodNewPoints.get(goodIdx)
+                            flowsX.add(nextP.x - prevP.x);
+                            flowsY.add(nextP.y - prevP.y);
+                            goodIdx++;
+                        }
                     }
-                    currCx = calculateMedian(xCoords);
-                    currCy = calculateMedian(yCoords);
+                    
+                    double medianFlowX = calculateMedian(flowsX);
+                    double medianFlowY = calculateMedian(flowsY);
+                    
+                    // Update Tracked Center by Flow
+                    trackedCx += medianFlowX;
+                    trackedCy += medianFlowY;
+                    
+                    currCx = trackedCx;
+                    currCy = trackedCy;
 
                     // Calculate Geometry Metrics for Degeneracy Check
                     double currentDiagonal = Math.sqrt(newTrackRect.width * newTrackRect.width + newTrackRect.height * newTrackRect.height);
                     
-                    double currentSumDist = 0;
+                    // INLIER RADIUS CALCULATION (Robust Scale)
+                    // 1. Calculate distances from Tracked Center
+                    List<Double> distances = new ArrayList<>();
                     for (Point p : goodNewPoints) {
                         double dx = p.x - currCx;
                         double dy = p.y - currCy;
-                        currentSumDist += Math.sqrt(dx*dx + dy*dy);
+                        distances.add(Math.sqrt(dx*dx + dy*dy));
                     }
-                    double currentAvgRadius = (goodNewPoints.size() > 0) ? currentSumDist / goodNewPoints.size() : 0.0;
+                    
+                    // 2. Filter Outliers (Points > 1.5 * Median Distance)
+                    double medianDist = calculateMedian(distances);
+                    double sumInlierDist = 0;
+                    int inlierCount = 0;
+                    double distThreshold = medianDist * 1.5;
+                    
+                    for (Double d : distances) {
+                        if (d <= distThreshold) {
+                            sumInlierDist += d;
+                            inlierCount++;
+                        }
+                    }
+                    
+                    double currentAvgRadius = (inlierCount > 0) ? sumInlierDist / inlierCount : 0.0;
 
                     // Degeneracy Check:
+
                     // If points collapse to a small cluster (radius < 10) or box is too small (diagonal < 20),
                     // tracking is likely failing or locking onto noise.
                     if (currentDiagonal > 20.0 && currentAvgRadius > 10.0) {
@@ -426,7 +478,8 @@ public class DollyZoomProcessor {
                         }
                         
                         // C. Mix
-                        rawScale = 0.7 * scaleBox + 0.3 * scaleRadius;
+                        // Balanced Mix to ensure stability and responsiveness
+                        rawScale = 0.6 * scaleBox + 0.4 * scaleRadius;
                         
                         // Clamping
                         if (rawScale > 10.0) rawScale = 10.0;
@@ -465,6 +518,10 @@ public class DollyZoomProcessor {
                     statePost.put(1, 0, smoothedCx);
                     statePost.put(2, 0, smoothedCy);
                     kalman.set_statePost(statePost);
+                    
+                    // Reset Tracked Center to Smoothed Position to prevent drift accumulation during loss
+                    trackedCx = smoothedCx;
+                    trackedCy = smoothedCy;
                     
                     // Use smoothed values as "current" to freeze effect
                     kScale = smoothedScale;
@@ -513,6 +570,9 @@ public class DollyZoomProcessor {
                 statePost.put(2, 0, smoothedCy);
                 kalman.set_statePost(statePost);
                 
+                trackedCx = smoothedCx;
+                trackedCy = smoothedCy;
+                
                 kScale = smoothedScale;
                 kCx = smoothedCx;
                 kCy = smoothedCy;
@@ -541,16 +601,23 @@ public class DollyZoomProcessor {
         double diffX = kCx - smoothedCx;
         double diffY = kCy - smoothedCy;
         double distSq = diffX*diffX + diffY*diffY;
+        double dist = Math.sqrt(distSq);
+
+        // REMOVED DEADZONE LOGIC to avoid "jumpy" artifacts.
+        // ADAPTIVE NON-LINEAR SMOOTHING (Continuous Ramp)
         
-        double dynamicAlphaPos = smoothAlphaPos;
-        // Threshold: if distance > 10 pixels (100 squared), boost alpha
-        if (distSq > 100.0) {
-            // Boost alpha based on distance. Max out at 1.0
-            // Example: dist=30px -> sq=900 -> boost=0.9
-            double boost = Math.min(1.0, distSq / 1000.0); 
-            dynamicAlphaPos = Math.max(smoothAlphaPos, boost);
-            if (dynamicAlphaPos > 1.0) dynamicAlphaPos = 1.0;
-        }
+        // 1. Base Alpha: Low enough for Lock Mode stability
+        double baseAlpha = 0.008; 
+        
+        // 2. Dynamic Response - Linear Ramp
+        // As distance increases, alpha increases linearly to catch up.
+        // No thresholds = No Jumps.
+        double sensitivity = 0.01; // Increase alpha by 0.01 per pixel of error
+        double dynamicAlphaPos = baseAlpha + (dist * sensitivity);
+        
+        // Cap at user setting
+        double targetMax = Math.max(smoothAlphaPos, 0.6);
+        if (dynamicAlphaPos > targetMax) dynamicAlphaPos = targetMax;
 
         smoothedCx = smoothedCx + dynamicAlphaPos * diffX;
         smoothedCy = smoothedCy + dynamicAlphaPos * diffY;
@@ -649,10 +716,21 @@ public class DollyZoomProcessor {
         M.put(1, 2, m12);
         
         // Apply WarpAffine with BORDER_REPLICATE
-        // This handles edges gracefully without hard black borders or forced zoom
+        // Reverting to INTER_LINEAR for performance (60fps target)
+        // INTER_CUBIC + GaussianBlur is too heavy for real-time mobile processing
         Imgproc.warpAffine(frame, result, M, new Size(width, height), Imgproc.INTER_LINEAR, Core.BORDER_REPLICATE, new Scalar(0, 0, 0));
         
         M.release();
+
+        // Sharpening removed to restore FPS
+        /*
+        if (smoothedScale > 1.2) {
+            Mat blurred = new Mat();
+            Imgproc.GaussianBlur(result, blurred, new Size(0, 0), 3);
+            Core.addWeighted(result, 1.5, blurred, -0.5, 0, result);
+            blurred.release();
+        }
+        */
 
         // Draw debug info
         String statusMode = trackerUpdated ? "TRACK" : "PREDICT";
